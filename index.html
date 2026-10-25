@@ -447,7 +447,8 @@
       await fn()
       setMsg(msgEl, '✓ Saved', 'ok')
     } catch (e) {
-      setMsg(msgEl, '✗ ' + e.message, 'err')
+      if (e.duplicate) setMsg(msgEl, e.message, 'info')
+      else setMsg(msgEl, '✗ ' + e.message, 'err')
     } finally {
       btn.disabled = false
       btn.textContent = label
@@ -457,12 +458,64 @@
   // ═══════════════════════════════════════════════════════════
   //  DATABASE
   // ═══════════════════════════════════════════════════════════
+  // ── Duplicate check ────────────────────────────────────────
+  // A hash is a short fingerprint calculated from the text. The same
+  // text always gives the same fingerprint, so if one is already in
+  // your brain, you have saved this before. Spaces and line breaks are
+  // evened out first so tiny formatting differences still match.
+  async function fingerprint(text) {
+    const normal = String(text).replace(/\s+/g, ' ').trim()
+    const bytes = new TextEncoder().encode(normal)
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
+  }
+
+  async function findExisting(field, value) {
+    const { data, error } = await db.from('thoughts')
+      .select('id, created_at')
+      .eq('metadata->>' + field, value)
+      .order('created_at', { ascending: true })
+      .limit(1)
+    if (error) { console.warn('Duplicate check skipped:', error.message); return null }
+    return data && data[0] ? data[0] : null
+  }
+
+  async function checkDuplicate(metadata) {
+    const checks = [
+      ['video_id', 'this YouTube video'],
+      ['url', 'this link'],
+      ['content_hash', 'this exact content']
+    ]
+    for (const [field, what] of checks) {
+      if (!metadata[field]) continue
+      const hit = await findExisting(field, metadata[field])
+      if (hit) {
+        const again = confirm('You already saved ' + what + ' on ' + fmt(hit.created_at) + '.\n\nPress OK to save another copy anyway, or Cancel to skip it.')
+        if (!again) {
+          const err = new Error('Not saved — you already have this one (saved ' + fmt(hit.created_at) + ').')
+          err.duplicate = true
+          throw err
+        }
+        return
+      }
+    }
+  }
+
   // Every insert carries user_id — the database rejects any row
   // that does not belong to whoever is signed in.
-  async function saveThought(content, metadata) {
+  // hashText is the text the fingerprint is made from (the content
+  // itself unless a caller says otherwise).
+  async function saveThought(content, metadata, hashText) {
     if (!currentUser) throw new Error('You are signed out. Sign in again.')
+    const meta = Object.assign({}, metadata || {})
+    try {
+      meta.content_hash = await fingerprint(hashText != null ? hashText : content)
+    } catch (e) {
+      console.warn('Could not fingerprint this capture:', e.message)
+    }
+    await checkDuplicate(meta)
     const { data, error } = await db.from('thoughts')
-      .insert({ content, user_id: currentUser.id, metadata: metadata || {} })
+      .insert({ content, user_id: currentUser.id, metadata: meta })
       .select('id').single()
     if (error) throw error
     return data.id
@@ -795,7 +848,7 @@
     if (!transcript) { setMsg($('ytMsg'), '✗ Paste the transcript first.', 'err'); return }
     await busy($('ytSave'), $('ytMsg'), async () => {
       const content = '📹 YouTube: ' + yt.title + '\nhttps://www.youtube.com/watch?v=' + yt.id + '\n\n' + transcript
-      const thoughtId = await saveThought(content, { video_id: yt.id })
+      const thoughtId = await saveThought(content, { video_id: yt.id }, transcript)
       await saveSource(thoughtId, transcript, 'youtube_transcript')
       $('ytTranscript').value = ''
       $('ytUrl').value = ''
@@ -1064,7 +1117,7 @@
       if (pdfFile.pages) meta.pages = pdfFile.pages
       if (pdfFile.title) meta.title = pdfFile.title
       const heading = pdfFile.title ? pdfFile.title + ' (' + pdfFile.name + ')' : pdfFile.name
-      await saveThought(KIND_LABEL[pdfFile.kind] + ': ' + heading + '\n\n' + text, meta)
+      await saveThought(KIND_LABEL[pdfFile.kind] + ': ' + heading + '\n\n' + text, meta, text)
       $('pdfReview').classList.add('hidden')
       $('pdfProgressWrap').classList.add('hidden')
       $('pdfText').value = ''
@@ -1109,7 +1162,7 @@
     if (!text) { setMsg($('urlMsg'), '✗ Paste the article text first.', 'err'); return }
     await busy($('urlSave'), $('urlMsg'), async () => {
       const content = '🔗 Web: ' + (title || url) + '\n' + url + '\n\n' + text
-      const thoughtId = await saveThought(content, { url })
+      const thoughtId = await saveThought(content, { url }, text)
       await saveSource(thoughtId, text, 'web')
       $('urlInput').value = ''
       $('urlTitle').value = ''
