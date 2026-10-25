@@ -275,18 +275,12 @@
             <div class="yt-title" id="ytTitle"></div>
           </div>
           <div class="help">
-            <b>YouTube will not hand transcripts to web pages</b>, so this part is copy and paste for now. Level 3 makes it automatic.
-            <ol>
-              <li>Click <b>Get Transcript</b> below. The video opens in a new tab.</li>
-              <li>Under the video, click <b>...more</b> in the description, then scroll down and click <b>Show transcript</b>.</li>
-              <li>In the transcript panel, click the text, then select it all (drag from the top to the bottom).</li>
-              <li>Copy it, come back here, and paste it into the box below.</li>
-            </ol>
-            Timestamps like <b>0:42</b> are removed automatically when you save.
+            <b>Your server fetches the transcript for you.</b> Just click <b>Save to Brain</b> — it can take up to 20 seconds.
+            If a video has no captions, its description is saved instead, and the saved thought says so.
           </div>
-          <a class="btn-link" id="ytOpen" href="#" target="_blank" rel="noopener">Get Transcript ↗</a>
-          <label class="field" for="ytTranscript">Transcript</label>
-          <textarea class="tall" id="ytTranscript" placeholder="Paste the transcript here..."></textarea>
+          <a class="btn-link" id="ytOpen" href="#" target="_blank" rel="noopener">Open video ↗</a>
+          <label class="field" for="ytTranscript">Transcript (optional)</label>
+          <textarea class="tall" id="ytTranscript" placeholder="Leave this empty — your server fetches the transcript. Only paste one here if the automatic fetch fails."></textarea>
           <div class="row">
             <button id="ytSave">Save to Brain</button>
             <span class="msg" id="ytMsg"></span>
@@ -333,7 +327,7 @@
     <section class="panel" id="panel-url">
       <div class="card">
         <p class="help">
-          <b>Browsers block one website from reading another</b>, for good security reasons. So for now, open the article, copy the part you want to keep, and paste it here. Level 3 makes this automatic.
+          <b>Paste a link and click Save to Brain</b> — your server fetches the article for you. If a site blocks it, open the page, copy the text, and paste it in the box below instead.
         </p>
         <label class="field" for="urlInput" style="margin-top:0">Link</label>
         <div class="row" style="margin-top:0; flex-wrap:nowrap">
@@ -342,8 +336,8 @@
         </div>
         <label class="field" for="urlTitle">Title (optional)</label>
         <input type="text" id="urlTitle" placeholder="What is this article?">
-        <label class="field" for="urlText">Article text</label>
-        <textarea class="tall" id="urlText" placeholder="Paste the article text here..."></textarea>
+        <label class="field" for="urlText">Article text (optional)</label>
+        <textarea class="tall" id="urlText" placeholder="Leave this empty — your server fetches the page. Only paste text here if the automatic fetch fails."></textarea>
         <div class="row">
           <button id="urlSave">Save to Brain</button>
           <span class="msg" id="urlMsg"></span>
@@ -537,6 +531,24 @@
     } catch (e) {
       console.warn('thought_sources insert failed (capture still saved):', e.message)
     }
+  }
+
+  // Calls one of your edge functions on Supabase. supabase-js sends your
+  // login token along automatically — that is how the function knows who
+  // you are, without ever trusting a user id typed into the request.
+  async function callFunction(name, body) {
+    if (!currentUser) throw new Error('You are signed out. Sign in again.')
+    const { data, error } = await db.functions.invoke(name, { body })
+    if (error) {
+      let msg = error.message
+      try {
+        const b = await error.context.json()
+        if (b && b.error) msg = b.error
+      } catch (e) { /* keep the general message */ }
+      throw new Error(msg)
+    }
+    if (data && data.ok === false) throw new Error(data.error || 'The server could not save that.')
+    return data
   }
 
   function renderThoughts(rows, container, emptyText) {
@@ -845,16 +857,32 @@
   $('ytSave').addEventListener('click', async () => {
     if (!yt.id) return
     const transcript = tidyTranscript($('ytTranscript').value)
-    if (!transcript) { setMsg($('ytMsg'), '✗ Paste the transcript first.', 'err'); return }
+    const title = yt.title
+    let result = null
     await busy($('ytSave'), $('ytMsg'), async () => {
-      const content = '📹 YouTube: ' + yt.title + '\nhttps://www.youtube.com/watch?v=' + yt.id + '\n\n' + transcript
-      const thoughtId = await saveThought(content, { video_id: yt.id }, transcript)
-      await saveSource(thoughtId, transcript, 'youtube_transcript')
+      if (transcript) {
+        // You pasted a transcript yourself — save it the Level 2 way
+        const content = '📹 YouTube: ' + yt.title + '\nhttps://www.youtube.com/watch?v=' + yt.id + '\n\n' + transcript
+        const thoughtId = await saveThought(content, { video_id: yt.id }, transcript)
+        await saveSource(thoughtId, transcript, 'youtube_transcript')
+        result = { has_transcript: true }
+      } else {
+        // Nothing pasted — your server (the capture-youtube function) fetches it
+        await checkDuplicate({ video_id: yt.id })
+        setMsg($('ytMsg'), 'Your server is fetching the transcript — this can take up to 20 seconds...', 'info')
+        result = await callFunction('capture-youtube', { url: 'https://www.youtube.com/watch?v=' + yt.id })
+      }
       $('ytTranscript').value = ''
       $('ytUrl').value = ''
       $('ytStep').classList.add('hidden')
       yt = { id: null, title: null }
     })
+    if (result) {
+      setMsg($('ytLookupMsg'), result.has_transcript
+        ? '✓ Saved "' + title + '" with its transcript.'
+        : '✓ Saved "' + title + '" — this video has no captions, so its description was saved instead.',
+        result.has_transcript ? 'ok' : 'info')
+    }
   })
 
   // ═══════════════════════════════════════════════════════════
@@ -1159,15 +1187,24 @@
     const title = decodeEntities($('urlTitle').value.trim())
     const text = decodeEntities($('urlText').value).trim()
     if (!url) { setMsg($('urlMsg'), '✗ Enter a valid link.', 'err'); return }
-    if (!text) { setMsg($('urlMsg'), '✗ Paste the article text first.', 'err'); return }
+    let result = null
     await busy($('urlSave'), $('urlMsg'), async () => {
-      const content = '🔗 Web: ' + (title || url) + '\n' + url + '\n\n' + text
-      const thoughtId = await saveThought(content, { url }, text)
-      await saveSource(thoughtId, text, 'web')
+      if (text) {
+        // You pasted the text yourself — save it the Level 2 way
+        const content = '🔗 Web: ' + (title || url) + '\n' + url + '\n\n' + text
+        const thoughtId = await saveThought(content, { url }, text)
+        await saveSource(thoughtId, text, 'web')
+      } else {
+        // Nothing pasted — your server (the capture-url function) fetches the page
+        await checkDuplicate({ url })
+        setMsg($('urlMsg'), 'Your server is fetching the page...', 'info')
+        result = await callFunction('capture-url', { url })
+      }
       $('urlInput').value = ''
       $('urlTitle').value = ''
       $('urlText').value = ''
     })
+    if (result) setMsg($('urlMsg'), '✓ Saved "' + result.title + '" (' + result.char_count.toLocaleString() + ' characters)', 'ok')
   })
 
   // ═══════════════════════════════════════════════════════════
