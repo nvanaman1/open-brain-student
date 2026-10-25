@@ -220,7 +220,7 @@
       <button class="tab active" data-tab="write">✏️ Write</button>
       <button class="tab" data-tab="voice">🎙️ Voice</button>
       <button class="tab" data-tab="youtube">📹 YouTube</button>
-      <button class="tab" data-tab="pdf">📄 PDF</button>
+      <button class="tab" data-tab="pdf">📄 Docs</button>
       <button class="tab" data-tab="url">🔗 URL</button>
       <button class="tab" data-tab="search">🔍 Search</button>
       <button class="tab" data-tab="recent">🕘 Recent</button>
@@ -295,14 +295,23 @@
       </div>
     </section>
 
-    <!-- PDF -->
+    <!-- DOCS (PDF, Word, text, Markdown) -->
     <section class="panel" id="panel-pdf">
       <div class="card">
         <div class="drop" id="pdfDrop" tabindex="0">
           <span class="big">📄</span>
-          Drop a PDF here, or click to choose one
+          Drop a document here, or click to choose one
+          <span class="hint" style="display:block; margin-top:8px">PDF · Word · PowerPoint · Web page (.html) · Text · Markdown · Images (.jpg .png)</span>
         </div>
-        <input type="file" id="pdfInput" accept="application/pdf,.pdf" class="hidden">
+        <input type="file" id="pdfInput" accept=".pdf,.docx,.pptx,.html,.htm,.txt,.md,.markdown,.jpg,.jpeg,.png,.webp,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/html,text/plain,text/markdown,image/jpeg,image/png,image/webp" class="hidden">
+        <div class="row" style="justify-content:flex-end">
+          <span class="hint">Language of text in images:</span>
+          <select id="ocrLang" aria-label="Language of text in images">
+            <option value="eng">English</option>
+            <option value="spa">Español</option>
+            <option value="eng+spa">Both</option>
+          </select>
+        </div>
         <div class="hidden" id="pdfProgressWrap">
           <div class="progress"><div id="pdfBar"></div></div>
           <div class="msg info" id="pdfProgress" style="margin-top:8px"></div>
@@ -796,14 +805,54 @@
   })
 
   // ═══════════════════════════════════════════════════════════
-  //  PDF  (text is pulled out right here in your browser — the
-  //        file itself never leaves your device)
+  //  DOCS — PDF, Word (.docx), text, Markdown. Every file is read
+  //  right here in your browser; the file itself never leaves your
+  //  device. Only the text you choose to save goes to your database.
   // ═══════════════════════════════════════════════════════════
   let pdfFile = null
   if (window.pdfjsLib) {
     pdfjsLib.GlobalWorkerOptions.workerSrc =
       'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
   }
+
+  // Extra readers are only downloaded the first time you need them,
+  // so the app stays fast for everything else. If one CDN is
+  // unreachable, the next one is tried.
+  const loaders = {}
+  function loadLib(name, globalName, urls) {
+    if (window[globalName]) return Promise.resolve()
+    if (loaders[name]) return loaders[name]
+    loaders[name] = new Promise((resolve, reject) => {
+      const tryNext = i => {
+        if (i >= urls.length) {
+          delete loaders[name]
+          reject(new Error('The ' + name + ' reader could not load. Check your connection and try again.'))
+          return
+        }
+        const el = document.createElement('script')
+        el.src = urls[i]
+        el.onload = () => window[globalName] ? resolve() : tryNext(i + 1)
+        el.onerror = () => { el.remove(); tryNext(i + 1) }
+        document.head.appendChild(el)
+      }
+      tryNext(0)
+    })
+    return loaders[name]
+  }
+  const loadMammoth = () => loadLib('Word', 'mammoth', [
+    'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js',
+    'https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js',
+    'https://unpkg.com/mammoth@1.6.0/mammoth.browser.min.js'
+  ])
+  const loadJSZip = () => loadLib('PowerPoint', 'JSZip', [
+    'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+    'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js',
+    'https://unpkg.com/jszip@3.10.1/dist/jszip.min.js'
+  ])
+  const loadTesseract = () => loadLib('image', 'Tesseract', [
+    'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+    'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
+  ])
 
   const drop = $('pdfDrop')
   drop.addEventListener('click', () => $('pdfInput').click())
@@ -813,57 +862,197 @@
   drop.addEventListener('drop', e => {
     e.preventDefault()
     drop.classList.remove('over')
-    if (e.dataTransfer.files[0]) handlePdf(e.dataTransfer.files[0])
+    if (e.dataTransfer.files[0]) handleDoc(e.dataTransfer.files[0])
   })
   $('pdfInput').addEventListener('change', e => {
-    if (e.target.files[0]) handlePdf(e.target.files[0])
+    if (e.target.files[0]) handleDoc(e.target.files[0])
     e.target.value = ''
   })
 
-  async function handlePdf(file) {
+  function kindOf(file) {
+    const n = file.name.toLowerCase()
+    if (n.endsWith('.pdf') || file.type === 'application/pdf') return 'pdf'
+    if (n.endsWith('.docx')) return 'docx'
+    if (n.endsWith('.pptx')) return 'pptx'
+    if (n.endsWith('.html') || n.endsWith('.htm') || file.type === 'text/html') return 'html'
+    if (/\.(jpe?g|png|webp)$/.test(n) || /^image\/(jpeg|png|webp)$/.test(file.type)) return 'image'
+    if (n.endsWith('.heic') || n.endsWith('.heif')) return 'heic'
+    if (n.endsWith('.ppt')) return 'old-ppt'
+    if (/\.(mov|mp4|m4v|avi|webm|mkv)$/.test(n) || file.type.startsWith('video/')) return 'video'
+    if (n.endsWith('.md') || n.endsWith('.markdown')) return 'md'
+    if (n.endsWith('.txt') || file.type === 'text/plain') return 'txt'
+    if (n.endsWith('.doc')) return 'old-doc'
+    if (n.endsWith('.pages')) return 'pages'
+    return null
+  }
+  const KIND_LABEL = {
+    pdf: '📄 PDF', docx: '📝 Word', pptx: '📊 PowerPoint', html: '🌐 Web page',
+    image: '🖼️ Image', txt: '📃 Text', md: '📃 Markdown'
+  }
+
+  function tidyText(t) {
+    return decodeEntities(t)
+      .replace(/\r\n?/g, '\n')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/ *\n */g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+  }
+
+  async function readPdf(file, progress) {
+    if (!window.pdfjsLib) throw new Error('The PDF reader did not load. Check your connection and reload the page.')
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise
+    const pages = []
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i)
+      const content = await page.getTextContent()
+      pages.push(content.items.map(it => it.str + (it.hasEOL ? '\n' : ' ')).join(''))
+      $('pdfBar').style.width = Math.round((i / pdf.numPages) * 100) + '%'
+      setMsg(progress, 'Reading page ' + i + ' of ' + pdf.numPages + '...', 'info')
+    }
+    return { text: tidyText(pages.join('\n\n')), pages: pdf.numPages }
+  }
+
+  async function readDocx(file, progress) {
+    setMsg(progress, 'Loading the Word reader...', 'info')
+    $('pdfBar').style.width = '30%'
+    await loadMammoth()
+    setMsg(progress, 'Reading ' + file.name + '...', 'info')
+    $('pdfBar').style.width = '60%'
+    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() })
+    $('pdfBar').style.width = '100%'
+    return { text: tidyText(result.value) }
+  }
+
+  // A .pptx is a zip of XML files: one per slide, plus speaker notes.
+  async function readPptx(file, progress) {
+    setMsg(progress, 'Loading the PowerPoint reader...', 'info')
+    await loadJSZip()
+    const zip = await JSZip.loadAsync(await file.arrayBuffer())
+    const num = path => parseInt(path.match(/(\d+)\.xml$/)[1], 10)
+    const slides = zip.file(/^ppt\/slides\/slide\d+\.xml$/).sort((a, b) => num(a.name) - num(b.name))
+    const textOf = xml => {
+      const doc = new DOMParser().parseFromString(xml, 'application/xml')
+      return Array.from(doc.getElementsByTagName('a:p'))
+        .map(p => Array.from(p.getElementsByTagName('a:t')).map(t => t.textContent).join(''))
+        .filter(line => line.trim())
+        .join('\n')
+    }
+    const parts = []
+    for (let i = 0; i < slides.length; i++) {
+      const n = num(slides[i].name)
+      const body = textOf(await slides[i].async('string'))
+      const notesFile = zip.file('ppt/notesSlides/notesSlide' + n + '.xml')
+      let notes = notesFile ? textOf(await notesFile.async('string')) : ''
+      notes = notes.replace(/^\d+$/gm, '').trim()   // drop the bare slide number notes pages carry
+      let chunk = '— Slide ' + (i + 1) + ' —\n' + (body || '(no text)')
+      if (notes) chunk += '\nNotes: ' + notes
+      parts.push(chunk)
+      $('pdfBar').style.width = Math.round(((i + 1) / slides.length) * 100) + '%'
+      setMsg(progress, 'Reading slide ' + (i + 1) + ' of ' + slides.length + '...', 'info')
+    }
+    return { text: tidyText(parts.join('\n\n')), pages: slides.length, unit: 'slide' }
+  }
+
+  // Keep the readable words of a saved web page; drop the code.
+  async function readHtml(file) {
+    const doc = new DOMParser().parseFromString(await file.text(), 'text/html')
+    doc.querySelectorAll('script, style, noscript, template, svg, iframe').forEach(el => el.remove())
+    doc.querySelectorAll('p, div, br, li, h1, h2, h3, h4, h5, h6, tr, section, article, header, footer, blockquote, pre, dt, dd')
+      .forEach(el => el.after(doc.createTextNode('\n')))
+    const title = decodeEntities((doc.title || '').trim())
+    const bodyText = tidyText(doc.body ? doc.body.textContent : '')
+    $('pdfBar').style.width = '100%'
+    return { text: bodyText, title }
+  }
+
+  // OCR: reads the words in a picture, right here in the browser.
+  async function readImage(file, progress) {
+    setMsg(progress, 'Loading the image reader (first time takes a moment)...', 'info')
+    await loadTesseract()
+    const lang = $('ocrLang').value
+    const worker = await Tesseract.createWorker(lang, 1, {
+      logger: m => {
+        if (m.status === 'recognizing text') {
+          $('pdfBar').style.width = Math.round(m.progress * 100) + '%'
+          setMsg(progress, 'Reading the text in your image... ' + Math.round(m.progress * 100) + '%', 'info')
+        } else if (m.status) {
+          setMsg(progress, 'Getting ready: ' + m.status + '...', 'info')
+        }
+      }
+    })
+    try {
+      const { data } = await worker.recognize(file)
+      return { text: tidyText(data.text || '') }
+    } finally {
+      await worker.terminate()
+    }
+  }
+
+  async function readPlain(file) {
+    $('pdfBar').style.width = '100%'
+    return { text: tidyText(await file.text()) }
+  }
+
+  async function handleDoc(file) {
     const progress = $('pdfProgress')
     $('pdfReview').classList.add('hidden')
     $('pdfProgressWrap').classList.remove('hidden')
     $('pdfBar').style.width = '0%'
 
-    if (!window.pdfjsLib) {
-      setMsg(progress, '✗ The PDF reader did not load. Check your connection and reload the page.', 'err')
+    const kind = kindOf(file)
+    if (kind === 'old-doc') {
+      setMsg(progress, '✗ This is an older Word file (.doc), which browsers cannot read. In Word, choose File → Save As → Word Document (.docx) or PDF, then drop that in.', 'err')
       return
     }
-    if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') {
-      setMsg(progress, '✗ That file is not a PDF.', 'err')
+    if (kind === 'old-ppt') {
+      setMsg(progress, '✗ This is an older PowerPoint file (.ppt), which browsers cannot read. In PowerPoint, choose File → Save As → PowerPoint Presentation (.pptx), then drop that in.', 'err')
+      return
+    }
+    if (kind === 'heic') {
+      setMsg(progress, '✗ HEIC photos (the iPhone default) cannot be read here. Open the photo in Preview and choose File → Export → JPEG, then drop that in.', 'err')
+      return
+    }
+    if (kind === 'video') {
+      setMsg(progress, '✗ Videos cannot be turned into text in the browser yet — that arrives with your server in Level 3. For now: if it is on YouTube use the YouTube tab, or open the Voice tab and play the video out loud near your mic.', 'err')
+      return
+    }
+    if (kind === 'pages') {
+      setMsg(progress, '✗ Pages files cannot be read in a browser. In Pages, choose File → Export To → PDF or Word, then drop that in.', 'err')
+      return
+    }
+    if (!kind) {
+      setMsg(progress, '✗ That file type is not supported. Use PDF, Word (.docx), PowerPoint (.pptx), .html, .txt, .md, .jpg or .png.', 'err')
       return
     }
 
     try {
       setMsg(progress, 'Opening ' + file.name + '...', 'info')
-      const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise
-      const pages = []
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i)
-        const content = await page.getTextContent()
-        pages.push(content.items.map(it => it.str + (it.hasEOL ? '\n' : ' ')).join(''))
-        $('pdfBar').style.width = Math.round((i / pdf.numPages) * 100) + '%'
-        setMsg(progress, 'Reading page ' + i + ' of ' + pdf.numPages + '...', 'info')
-      }
-      const text = decodeEntities(pages.join('\n\n'))
-        .replace(/[ \t]+/g, ' ')
-        .replace(/ *\n */g, '\n')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim()
+      const result = kind === 'pdf' ? await readPdf(file, progress)
+                   : kind === 'docx' ? await readDocx(file, progress)
+                   : kind === 'pptx' ? await readPptx(file, progress)
+                   : kind === 'html' ? await readHtml(file)
+                   : kind === 'image' ? await readImage(file, progress)
+                   : await readPlain(file)
 
-      if (!text) {
-        setMsg(progress, '✗ No text found. This PDF is probably scanned pictures of pages, which have no text to pull out.', 'err')
+      if (!result.text) {
+        setMsg(progress, kind === 'pdf'
+          ? '✗ No text found. This PDF is probably scanned pictures of pages, which have no text to pull out.'
+          : kind === 'image'
+          ? '✗ No text found in this image. OCR only works on pictures that contain words — screenshots, slides, signs, neat notes.'
+          : '✗ No text found in this file.', 'err')
         return
       }
-      pdfFile = { name: file.name, pages: pdf.numPages }
-      setMsg(progress, '✓ Read ' + pdf.numPages + ' page' + (pdf.numPages === 1 ? '' : 's') + ', ' + text.length.toLocaleString() + ' characters. Review below, then save.', 'ok')
-      $('pdfName').textContent = '📄 ' + file.name
-      $('pdfText').value = text
+      pdfFile = { name: file.name, kind, pages: result.pages, title: result.title }
+      const unit = result.unit || 'page'
+      const pagesNote = result.pages ? result.pages + ' ' + unit + (result.pages === 1 ? '' : 's') + ', ' : ''
+      setMsg(progress, '✓ Read ' + pagesNote + result.text.length.toLocaleString() + ' characters. Review below, then save.', 'ok')
+      $('pdfName').textContent = KIND_LABEL[kind] + ' · ' + file.name
+      $('pdfText').value = result.text
       $('pdfReview').classList.remove('hidden')
       setMsg($('pdfMsg'), '')
     } catch (e) {
-      setMsg(progress, '✗ Could not read this PDF: ' + e.message, 'err')
+      setMsg(progress, '✗ Could not read this file: ' + e.message, 'err')
     }
   }
 
@@ -871,7 +1060,11 @@
     const text = $('pdfText').value.trim()
     if (!text || !pdfFile) return
     await busy($('pdfSave'), $('pdfMsg'), async () => {
-      await saveThought('📄 PDF: ' + pdfFile.name + '\n\n' + text, { filename: pdfFile.name, pages: pdfFile.pages })
+      const meta = { filename: pdfFile.name, file_kind: pdfFile.kind }
+      if (pdfFile.pages) meta.pages = pdfFile.pages
+      if (pdfFile.title) meta.title = pdfFile.title
+      const heading = pdfFile.title ? pdfFile.title + ' (' + pdfFile.name + ')' : pdfFile.name
+      await saveThought(KIND_LABEL[pdfFile.kind] + ': ' + heading + '\n\n' + text, meta)
       $('pdfReview').classList.add('hidden')
       $('pdfProgressWrap').classList.add('hidden')
       $('pdfText').value = ''
@@ -881,7 +1074,7 @@
     if ($('pdfMsg').classList.contains('ok')) {
       $('pdfProgressWrap').classList.remove('hidden')
       $('pdfBar').style.width = '0%'
-      setMsg($('pdfProgress'), '✓ Saved to your brain. Drop another PDF any time.', 'ok')
+      setMsg($('pdfProgress'), '✓ Saved to your brain. Drop another document any time.', 'ok')
     }
   })
   $('pdfCancel').addEventListener('click', () => {
